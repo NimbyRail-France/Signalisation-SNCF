@@ -1,0 +1,50 @@
+[ModMeta]
+schema=1
+name=Signalisation SNCF
+desc=Tous les types de signalisation SNCF.
+author=Sami S
+version=0.0.1
+
+[Script]
+id=sncf_script
+name=SNCF Script
+source=src/sncf.nimbyscript
+
+[SignalTextures]
+id=bal_textures
+name_loc=template_bal_type_a
+name_en=BAL Type A
+ui_rotate=1
+state=textures/BAL/bal_v.png
+state=textures/BAL/bal_r.png
+state=textures/BAL/bal_j.png
+state=textures/BAL/bal_vce.png
+state=textures/BAL/bal_vc.png
+state=textures/BAL/bal_jce.png
+state=textures/BAL/bal_jc.png
+state=textures/BAL/bal_rc.png
+state=textures/BAL/bal_rce.png
+
+[SignalTemplate]
+id=sncf_bal_A_template
+name_en=BAL Type A
+name_loc=template_bal_type_a
+kind=path
+textures=bal_textures
+extend=sncf_script BalFRA
+
+[Language]
+code_iso_639_2=fra
+name=Français
+
+[LanguageDict]
+code_iso_639_2=fra
+po=loc/fr.po
+
+[Language]
+code_iso_639_2=eng
+name=English
+
+[LanguageDict]
+code_iso_639_2=eng
+po=loc/en.po

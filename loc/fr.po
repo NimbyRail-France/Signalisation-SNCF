@@ -1,0 +1,7 @@
+# French translation for SNCF Signalling Mod
+
+
+msgctxt "template_bal_type_a"
+msgid "BAL Type A"
+msgstr "BAL Type A"
+

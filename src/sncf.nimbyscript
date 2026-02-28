@@ -1,0 +1,583 @@
+script meta {
+    lang: nimbyscript.v1,
+    api: nimbyrails.v1,
+    description: [
+        "BAL FR - Courbe de freinage (KVB) sans opérateurs logiques (pas de && ni ||)",
+        "S (rouge) = bloc occupe.",
+        "A (jaune) = Arme la courbe KVB vers le prochain signal rouge.",
+        "Freinage fluide calcule dans le lookahead jusqu'a 30 km/h a 200m.",
+        "Rouge cli = cap 15",
+        "A cli = cap 90",
+        "VL cli = cap 160",
+    ],
+}
+
+// ----- Constantes -----
+const SPEED_15_MS:  f64 = 4.166666666666667;
+const SPEED_30_MS:  f64 = 8.333333333333334;
+const SPEED_90_MS:  f64 = 25.0;
+const SPEED_160_MS: f64 = 44.44444444444444;
+const SPEED_EPS_MS: f64 = 0.01;                   
+const KMH_TO_MS:    f64 = 1.0;                    
+
+const KVB_TARGET_DIST: f64 = 200.0;
+const KVB_SLOPE: f64 = 0.024;
+
+const DIST_160_ARM_M: f64 = 400.0;
+const BLINK_US: i64 = 3000000;
+
+// ----- Structures -----
+struct BlockOcc { train_id: ID<Train>, }
+struct TrainLast { prev: ID<Signal>, }
+struct TrainSpeedCap { until_signal: ID<Signal>, cap_ms: f64, }
+struct SignalVcli { train_id: ID<Train>, }
+struct KvbCurve { target_signal: ID<Signal>, }
+
+// ----------------------------------------------------
+// BAL FRA
+// ----------------------------------------------------
+pub struct BalFRA extend Signal {
+    next_signal: ID<Signal> meta { label: "Signal Suivant", },
+    next_next_signal: ID<Signal> meta { label: "Signal Après Suivant", },
+    enable_a_clignotant: bool meta { label: "Activer Jaune Clignotant", default: false, },
+    enable_r_clignotant: bool meta { label: "Activer Rouge Clignotant", default: false, },
+    force_vcli: bool meta { label: "Forcer Vert Clignotant", default: false, },
+    short_to_next: bool meta { label: "Distance Courte vers Suivant", default: false, },
+    short_to_next_next: bool meta { label: "Distance Courte après Suivant", default: false, },
+    force_reset: bool meta { label: "Réinitialiser Canton", default: false, },
+}
+
+// ---------------- CHECK ----------------
+pub fn BalFRA::event_signal_check(
+    self: &BalFRA, ctx: &EventCtx, train: &Train, motion: &Motion,
+    signal: &Signal, sc: &mut SimpleSimController
+): SignalCheck {
+    let empty_train = ID<Train>::empty();
+
+    if self.force_reset {
+        let clr = BlockOcc::new();
+        clr.train_id = empty_train;
+        sc.queue_attach(signal, clr);
+        return SignalCheck::Pass;
+    }
+
+    if let occ &= ctx.db.view<BlockOcc>(signal) {
+        if !occ.train_id.equals(empty_train) {
+            if !is_valid(ctx.db.view(occ.train_id)) {
+                let clr2 = BlockOcc::new();
+                clr2.train_id = empty_train;
+                sc.queue_attach(signal, clr2);
+                return SignalCheck::Pass;
+            }
+            if !occ.train_id.equals(motion.train_id) { return SignalCheck::Stop; }
+        }
+    }
+    return SignalCheck::Pass;
+}
+
+// ---------------- LOOKAHEAD ----------------
+// ---------------- LOOKAHEAD ----------------
+pub fn BalFRA::event_signal_lookahead(
+    self: &BalFRA, ctx: &EventCtx, train: &Train, motion: &Motion,
+    signal: &Signal, train_distance: f64, check: SignalCheck,
+    sc: &mut SimpleSimController, result: &mut SignalLookaheadResult
+) {
+    let empty_sig   = ID<Signal>::empty();
+    let empty_train = ID<Train>::empty();
+
+    // 1) LIRE LES LIMITATIONS FIXES EN PREMIER (Correction du bug !)
+    if let cap0 &= ctx.db.view<TrainSpeedCap>(train) {
+        if !cap0.until_signal.equals(empty_sig) {
+            if result.max_speed <= 0.0 { result.max_speed = cap0.cap_ms; }
+            else if result.max_speed > cap0.cap_ms { result.max_speed = cap0.cap_ms; }
+        }
+    }
+
+    // 2) LECTURE DE LA COURBE KVB SI LE SIGNAL EST ROUGE
+    if let occ_self &= ctx.db.view<BlockOcc>(signal) {
+        if !occ_self.train_id.equals(empty_train) {
+            if let curve &= ctx.db.view<KvbCurve>(train) {
+                if curve.target_signal.equals(signal.id) {
+                    let target_ms mut= SPEED_30_MS;
+                    if train_distance > KVB_TARGET_DIST {
+                        target_ms = SPEED_30_MS + ((train_distance - KVB_TARGET_DIST) * KVB_SLOPE);
+                    }
+                    if target_ms > SPEED_160_MS { target_ms = SPEED_160_MS; }
+                    if result.max_speed <= 0.0 { result.max_speed = target_ms; }
+                    else if result.max_speed > target_ms { result.max_speed = target_ms; }
+                    return; 
+                }
+            }
+            if train_distance < 300.0 {
+                if result.max_speed <= 0.0 { result.max_speed = SPEED_30_MS; }
+                else if result.max_speed > SPEED_30_MS { result.max_speed = SPEED_30_MS; }
+            }
+            return;
+        }
+    }
+
+    // 3) LE RESTE DU CODE (VCLI, Topo, etc.)
+    let speed_ms mut= 0.0;
+    if let presence &= motion.presence.get() { speed_ms = presence.speed; }
+
+    let vcli_fast mut= false;
+    if speed_ms > SPEED_160_MS + SPEED_EPS_MS { vcli_fast = true; }
+
+    if let vcli &= ctx.db.view<SignalVcli>(signal) {
+        if !is_valid(ctx.db.view(vcli.train_id)) { sc.queue_erase(vcli); }
+    }
+    if vcli_fast {
+        let need_attach mut= true;
+        if let vcli2 &= ctx.db.view<SignalVcli>(signal) {
+            if vcli2.train_id.equals(motion.train_id) { need_attach = false; }
+        }
+        if need_attach {
+            let vcli3 = SignalVcli::new();
+            vcli3.train_id = motion.train_id;
+            sc.queue_attach(signal, vcli3);
+        }
+    } else {
+        if let vcli4 &= ctx.db.view<SignalVcli>(signal) {
+            if vcli4.train_id.equals(motion.train_id) { sc.queue_erase(vcli4); }
+        }
+    }
+
+    let next_id = self.next_signal;
+    let next_is_red mut= false;
+    if !next_id.equals(empty_sig) {
+        if let next_sig &= ctx.db.view(next_id) {
+            if let occ_next &= ctx.db.view<BlockOcc>(next_sig) {
+                if !occ_next.train_id.equals(empty_train) { next_is_red = true; }
+            }
+        }
+    }
+
+    let next_will_be_a mut= false;
+    let next_will_be_rcli mut= false;
+
+    if !next_id.equals(empty_sig) {
+        if let next_sig2 &= ctx.db.view(next_id) {
+            if let next_bal &= ctx.db.view<BalFRA>(next_sig2) {
+                let nn2 = next_bal.next_signal;
+                if !nn2.equals(empty_sig) {
+                    if let nn_sig2 &= ctx.db.view(nn2) {
+                        if let occ_nn2 &= ctx.db.view<BlockOcc>(nn_sig2) {
+                            if !occ_nn2.train_id.equals(empty_train) {
+                                next_will_be_a = true;
+                                if next_bal.short_to_next {
+                                    if next_bal.enable_r_clignotant {
+                                        next_will_be_rcli = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let annonce_a mut= false;
+    let nn_id = self.next_next_signal;
+    if !nn_id.equals(empty_sig) {
+        if let nn_sig &= ctx.db.view(nn_id) {
+            if let occ_nn &= ctx.db.view<BlockOcc>(nn_sig) {
+                if !occ_nn.train_id.equals(empty_train) { annonce_a = true; }
+            }
+        }
+    }
+
+    let cur_ms mut= 999999.0;
+    let next_ms mut= 999999.0;
+    
+    let pcur = signal.forward();
+    let tcur = pcur.track_id;
+    if let trc &= ctx.db.view(tcur) { cur_ms = trc.max_speed() * KMH_TO_MS; }
+    
+    if !next_id.equals(empty_sig) {
+        if let next_sig_obj &= ctx.db.view(next_id) {
+            let pnext = next_sig_obj.forward();
+            let tnext = pnext.track_id;
+            if let trn &= ctx.db.view(tnext) { next_ms = trn.max_speed() * KMH_TO_MS; }
+        }
+    }
+
+    let enters_160 mut= false;
+    if cur_ms > SPEED_160_MS + SPEED_EPS_MS {
+        if next_ms <= SPEED_160_MS + SPEED_EPS_MS {
+            enters_160 = true;
+        }
+    }
+
+    let annonce_a_160 mut= false;
+    if annonce_a {
+        if next_ms > SPEED_160_MS + SPEED_EPS_MS {
+            annonce_a_160 = true;
+        }
+    }
+
+    let topo_160 mut= false;
+    if enters_160 { topo_160 = true; }
+    if annonce_a_160 { topo_160 = true; }
+
+    if topo_160 {
+        if speed_ms > SPEED_160_MS + SPEED_EPS_MS {
+            if train_distance < DIST_160_ARM_M {
+                if !next_id.equals(empty_sig) {
+                    let need_attach160 mut= true;
+                    if let cap_old160 &= ctx.db.view<TrainSpeedCap>(train) {
+                        let is_same_id mut= false;
+                        if cap_old160.until_signal.equals(next_id) {
+                            if cap_old160.cap_ms == SPEED_160_MS {
+                                is_same_id = true;
+                            }
+                        }
+                        if is_same_id {
+                            need_attach160 = false;
+                        } else {
+                            sc.queue_erase(cap_old160);
+                        }
+                    }
+                    if need_attach160 {
+                        let cap160 = TrainSpeedCap::new();
+                        cap160.until_signal = next_id;
+                        cap160.cap_ms = SPEED_160_MS;
+                        sc.queue_attach(train, cap160);
+                    }
+                }
+                if result.max_speed <= 0.0 { result.max_speed = SPEED_160_MS; }
+                else if result.max_speed > SPEED_160_MS { result.max_speed = SPEED_160_MS; }
+            }
+        }
+    }
+}
+// ---------------- PASS BY ----------------
+pub fn BalFRA::event_signal_pass_by(
+    self: &BalFRA, ctx: &EventCtx, train: &Train, motion: &Motion,
+    signal: &Signal, sc: &mut SimController
+) {
+    let empty_sig   = ID<Signal>::empty();
+    let empty_train = ID<Train>::empty();
+
+    if let cap &= ctx.db.view<TrainSpeedCap>(train) {
+        let erase_cap mut= false;
+        if cap.until_signal.equals(signal.id) { erase_cap = true; }
+        if cap.until_signal.equals(empty_sig) { erase_cap = true; }
+        if !is_valid(ctx.db.view(cap.until_signal)) { erase_cap = true; }
+        if erase_cap {
+            sc.queue_erase(cap);
+        }
+    }
+    
+    if let old_curve &= ctx.db.view<KvbCurve>(train) { sc.queue_erase(old_curve); }
+    if let vcli &= ctx.db.view<SignalVcli>(signal) {
+        if vcli.train_id.equals(motion.train_id) { sc.queue_erase(vcli); }
+    }
+
+    let next_id = self.next_signal;
+    let next_is_red mut= false;
+    if !next_id.equals(empty_sig) {
+        if let next_sig &= ctx.db.view(next_id) {
+            if let occ_next &= ctx.db.view<BlockOcc>(next_sig) {
+                if !occ_next.train_id.equals(empty_train) { next_is_red = true; }
+            }
+        }
+    }
+
+    let next_will_be_a mut= false;
+    let next_will_be_rcli mut= false;
+    if !next_id.equals(empty_sig) {
+        if let next_sig2 &= ctx.db.view(next_id) {
+            if let next_bal &= ctx.db.view<BalFRA>(next_sig2) {
+                let nn2 = next_bal.next_signal;
+                if !nn2.equals(empty_sig) {
+                    if let nn_sig2 &= ctx.db.view(nn2) {
+                        if let occ_nn2 &= ctx.db.view<BlockOcc>(nn_sig2) {
+                            if !occ_nn2.train_id.equals(empty_train) {
+                                next_will_be_a = true;
+                                if next_bal.short_to_next {
+                                    if next_bal.enable_r_clignotant {
+                                        next_will_be_rcli = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let next_is_acli mut= false;
+    if !next_id.equals(empty_sig) {
+        if let next_sig3 &= ctx.db.view(next_id) {
+            if let next_bal2 &= ctx.db.view<BalFRA>(next_sig3) {
+                if next_bal2.enable_a_clignotant {
+                    if next_bal2.short_to_next_next {
+                        let nn2 = next_bal2.next_signal;
+                        if !nn2.equals(empty_sig) {
+                            if let nn_sig3 &= ctx.db.view(nn2) {
+                                if let nn_bal3 &= ctx.db.view<BalFRA>(nn_sig3) {
+                                    let nnn_id = nn_bal3.next_signal;
+                                    if !nnn_id.equals(empty_sig) {
+                                        if let nnn_sig &= ctx.db.view(nnn_id) {
+                                            if let occ_nnn &= ctx.db.view<BlockOcc>(nnn_sig) {
+                                                if !occ_nnn.train_id.equals(empty_train) {
+                                                    let is_rcli_nnn mut= false;
+                                                    if nn_bal3.short_to_next {
+                                                        if nn_bal3.enable_r_clignotant {
+                                                            is_rcli_nnn = true;
+                                                        }
+                                                    }
+                                                    if !is_rcli_nnn {
+                                                        next_is_acli = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let is_acli_current mut= false;
+    if self.enable_a_clignotant {
+        if self.short_to_next_next {
+            if next_will_be_a {
+                if !next_will_be_rcli {
+                    is_acli_current = true;
+                }
+            }
+        }
+    }
+
+    let is_rcli_current mut= false;
+    if next_is_red {
+        if self.short_to_next {
+            if self.enable_r_clignotant {
+                is_rcli_current = true;
+            }
+        }
+    }
+
+    let vcli_force = self.force_vcli;
+    let vcli_prewarn mut= false;
+    let cur_ms mut= 999999.0;
+    
+    let pcur = signal.forward();
+    let tcur = pcur.track_id;
+    if let trc &= ctx.db.view(tcur) { cur_ms = trc.max_speed() * KMH_TO_MS; }
+    
+    if cur_ms > SPEED_160_MS + SPEED_EPS_MS {
+        if next_will_be_a { vcli_prewarn = true; }
+        if next_is_acli { vcli_prewarn = true; }
+    }
+
+    let vcli_shown mut= false;
+    if !next_is_red {
+        if !next_will_be_rcli {
+            if !is_acli_current {
+                if vcli_force { vcli_shown = true; }
+                if vcli_prewarn { vcli_shown = true; }
+            }
+        }
+    }
+
+    if !next_id.equals(empty_sig) {
+        if is_rcli_current {
+            let new_cap = TrainSpeedCap::new();
+            new_cap.until_signal = next_id;
+            new_cap.cap_ms = SPEED_15_MS;
+            sc.queue_attach(train, new_cap);
+        } else if next_is_red {
+            let new_curve = KvbCurve::new();
+            new_curve.target_signal = next_id;
+            sc.queue_attach(train, new_curve);
+        } else if next_will_be_rcli {
+            let new_cap = TrainSpeedCap::new();
+            new_cap.until_signal = next_id;
+            new_cap.cap_ms = SPEED_90_MS;
+            sc.queue_attach(train, new_cap);
+        } else if is_acli_current {
+            let new_cap = TrainSpeedCap::new();
+            new_cap.until_signal = next_id;
+            new_cap.cap_ms = SPEED_90_MS;
+            sc.queue_attach(train, new_cap);
+        } else if vcli_shown {
+            let new_cap = TrainSpeedCap::new();
+            new_cap.until_signal = next_id;
+            new_cap.cap_ms = SPEED_160_MS;
+            sc.queue_attach(train, new_cap);
+        }
+    }
+
+    if let last &= ctx.db.view<TrainLast>(train) {
+        let prev_id = last.prev;
+        if !prev_id.equals(empty_sig) {
+            if let prev_sig &= ctx.db.view(prev_id) {
+                if let occ_prev &= ctx.db.view<BlockOcc>(prev_sig) {
+                    if occ_prev.train_id.equals(motion.train_id) {
+                        let clr = BlockOcc::new();
+                        clr.train_id = empty_train;
+                        sc.queue_attach(prev_sig, clr);
+                    }
+                }
+            }
+        }
+    }
+
+    let occ = BlockOcc::new();
+    occ.train_id = motion.train_id;
+    sc.queue_attach(signal, occ);
+
+    let tl = TrainLast::new();
+    tl.prev = signal.id;
+    sc.queue_attach(train, tl);
+}
+
+// ---------------- TEXTURE STATE ----------------
+pub fn BalFRA::event_signal_texture_state(
+    self: &BalFRA, db: &DB, signal: &Signal, clock_us: i64, core_state : i64
+): i64 {
+    let empty_train = ID<Train>::empty();
+    let empty_sig   = ID<Signal>::empty();
+
+    if let occ &= db.view<BlockOcc>(signal) {
+        if !occ.train_id.equals(empty_train) { return 1; }
+    }
+
+    let next_id = self.next_signal;
+    let next_is_red mut= false;
+
+    if !next_id.equals(empty_sig) {
+        if let next_sig &= db.view(next_id) {
+            if let occ2 &= db.view<BlockOcc>(next_sig) {
+                if !occ2.train_id.equals(empty_train) { next_is_red = true; }
+            }
+        }
+    }
+
+    let short_to_next = self.short_to_next;
+
+    if next_is_red {
+        if short_to_next {
+            if self.enable_r_clignotant {
+                let ph = zmod(zdiv(clock_us, BLINK_US), 2);
+                if ph == 0 { return 7; } 
+                return 8;                
+            }
+        }
+        return 2; 
+    }
+
+    let next_will_be_a mut= false;
+    let next_will_be_rcli mut= false;
+
+    if !next_id.equals(empty_sig) {
+        if let next_sig2 &= db.view(next_id) {
+            if let next_bal &= db.view<BalFRA>(next_sig2) {
+                let nn2 = next_bal.next_signal;
+                if !nn2.equals(empty_sig) {
+                    if let nn_sig2 &= db.view(nn2) {
+                        if let occ_nn2 &= db.view<BlockOcc>(nn_sig2) {
+                            if !occ_nn2.train_id.equals(empty_train) {
+                                next_will_be_a = true;
+                                if next_bal.short_to_next {
+                                    if next_bal.enable_r_clignotant {
+                                        next_will_be_rcli = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if next_will_be_rcli { return 2; }
+
+    let next_is_acli mut= false;
+    if !next_id.equals(empty_sig) {
+        if let next_sig3 &= db.view(next_id) {
+            if let next_bal2 &= db.view<BalFRA>(next_sig3) {
+                if next_bal2.enable_a_clignotant {
+                    if next_bal2.short_to_next_next {
+                        let nn2 = next_bal2.next_signal;
+                        if !nn2.equals(empty_sig) {
+                            if let nn_sig3 &= db.view(nn2) {
+                                if let nn_bal3 &= db.view<BalFRA>(nn_sig3) {
+                                    let nnn_id = nn_bal3.next_signal;
+                                    if !nnn_id.equals(empty_sig) {
+                                        if let nnn_sig &= db.view(nnn_id) {
+                                            if let occ_nnn &= db.view<BlockOcc>(nnn_sig) {
+                                                if !occ_nnn.train_id.equals(empty_train) {
+                                                    let is_rcli_nnn mut= false;
+                                                    if nn_bal3.short_to_next {
+                                                        if nn_bal3.enable_r_clignotant {
+                                                            is_rcli_nnn = true;
+                                                        }
+                                                    }
+                                                    if !is_rcli_nnn {
+                                                        next_is_acli = true;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let is_acli_current mut= false;
+    if self.enable_a_clignotant {
+        if self.short_to_next_next {
+            if next_will_be_a {
+                if !next_will_be_rcli {
+                    is_acli_current = true;
+                }
+            }
+        }
+    }
+
+    if is_acli_current {
+        let ph2 = zmod(zdiv(clock_us, BLINK_US), 2);
+        if ph2 == 0 { return 6; } 
+        return 5;                 
+    }
+
+    let cur_ms mut= 999999.0;
+    
+    let pcur = signal.forward();
+    let tcur = pcur.track_id;
+    if let trc &= db.view(tcur) { cur_ms = trc.max_speed() * KMH_TO_MS; }
+
+    let vcli_force = self.force_vcli;
+    let vcli_prewarn mut= false;
+    if cur_ms > SPEED_160_MS + SPEED_EPS_MS {
+        if next_will_be_a { vcli_prewarn = true; }
+        if next_is_acli { vcli_prewarn = true; }
+    }
+
+    let vcli_should mut= false;
+    if vcli_force { vcli_should = true; }
+    if vcli_prewarn { vcli_should = true; }
+
+    if vcli_should {
+        let ph4 = zmod(zdiv(clock_us, BLINK_US), 2);
+        if ph4 == 0 { return 4; } 
+        return 3;                 
+    }
+
+    return 0; 
+}

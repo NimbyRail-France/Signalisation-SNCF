@@ -15,21 +15,22 @@ id=bal_textures
 name_loc=template_bal_type_a
 name_en=BAL Type A
 ui_rotate=1
-state=textures/BAL/bal_v.png
-state=textures/BAL/bal_r.png
-state=textures/BAL/bal_j.png
-state=textures/BAL/bal_vce.png
-state=textures/BAL/bal_vc.png
-state=textures/BAL/bal_jce.png
-state=textures/BAL/bal_jc.png
-state=textures/BAL/bal_rc.png
-state=textures/BAL/bal_rce.png
+state=textures/BAL/bal_v.svg
+state=textures/BAL/bal_r.svg
+state=textures/BAL/bal_j.svg
+state=textures/BAL/bal_vce.svg
+state=textures/BAL/bal_vc.svg
+state=textures/BAL/bal_jce.svg
+state=textures/BAL/bal_jc.svg
+state=textures/BAL/bal_rc.svg
+state=textures/BAL/bal_rce.svg
 
 [SignalTemplate]
 id=sncf_bal_A_template
 name_en=BAL Type A
 name_loc=template_bal_type_a
 kind=path
+size=2
 textures=bal_textures
 extend=sncf_script BalFRA
 

@@ -2,488 +2,349 @@ script meta {
     lang: nimbyscript.v1,
     api: nimbyrails.v1,
     description: [
-        "BAL FR - Courbe KVB Dynamique (Vraie physique du train sans && ni ||)",
-        "S (rouge) = Bloc occupe, arret absolu.",
-        "R cli = Bloc occupe franchissable, courbe vers 15km/h puis marche a vue.",
-        "A (jaune) = Arme la courbe KVB vers le signal ferme.",
-        "A cli = Canton court, limite a 90 km/h.",
-        "VL cli = Pre-annonce, limite a 160 km/h.",
+        "SNCF BAL - Stop & Proceed (Fix Vitesse)",
+        "S (rouge) = Arrêt marqué (0 km/h) puis 30 km/h bloqué.",
+        "R cli = Franchit à 15km/h, puis 30 km/h bloqué.",
     ],
 }
 
-// ----- Constantes -----
+// ----- Constantes (m/s) -----
 const SPEED_15_MS:  f64 = 4.166666666666667;
 const SPEED_30_MS:  f64 = 8.333333333333334;
 const SPEED_90_MS:  f64 = 25.0;
 const SPEED_160_MS: f64 = 44.44444444444444;
-const SPEED_EPS_MS: f64 = 0.01;                   
-const KMH_TO_MS:    f64 = 1.0;                    
+const BLINK_US:     i64 = 3000000; 
 
 const KVB_TARGET_DIST: f64 = 300.0;
-const RCLI_TARGET_DIST: f64 = 50.0; // Le train vise 15km/h a 50m du Rouge Clignotant
+const RCLI_TARGET_DIST: f64 = 50.0; 
 
-const DIST_160_ARM_M: f64 = 400.0;
-const BLINK_US: i64 = 3000000;
-
-// ----- Structures -----
+// ----- Structures privées -----
 struct BlockOcc { train_id: ID<Train>, }
-struct TrainLast { prev: ID<Signal>, }
-struct TrainSpeedCap { until_signal: ID<Signal>, cap_ms: f64, }
-struct SignalVcli { train_id: ID<Train>, }
-struct KvbCurve { target_signal: ID<Signal>, }
-struct RcliCurve { target_signal: ID<Signal>, } 
+struct TrainSpeedCap { cap_ms: f64, }
+struct TrainLast { prev_signal: ID<Signal>, }
+
+struct TrainSpeed15 { signal_id: ID<Signal>, }
+struct TrainSpeed30 { signal_id: ID<Signal>, }
+struct TrainMarkedStop { signal_id: ID<Signal>, }
+
+struct CheckTailTask {
+    train_id: ID<Train>,
+    signal_to_clear: ID<Signal>,
+    signal_to_watch: ID<Signal>,
+}
+
+struct CheckClearTask {
+    train_id: ID<Train>,
+    signal_id: ID<Signal>,
+}
+
+// ----------------------------------------------------
+// TÂCHE 1 : DÉGAGEMENT (15 -> 30)
+// ----------------------------------------------------
+pub fn CheckClearTask::task_run(self: &CheckClearTask, ctx: &ControlCtx, sc: &mut SimController) {
+    let trn_id = self.train_id;
+    let sig_id = self.signal_id;
+    
+    let trn_ptr = ctx.db.view(trn_id);
+    if !is_valid(trn_ptr) { return; }
+    let trn_obj &= trn_ptr else { return; }
+
+    if let sig_obj &= ctx.db.view(sig_id) {
+        let p_cur = sig_obj.forward();
+        
+        if ctx.extrapolator.is_occupying(p_cur, trn_id) {
+            let next_task = CheckClearTask::new();
+            next_task.train_id = trn_id;
+            next_task.signal_id = sig_id;
+            sc.queue_task_at(next_task, ctx.extrapolator.clock_us() + 1000000);
+        } else {
+            if let old_15 &= ctx.db.view<TrainSpeed15>(trn_obj) {
+                sc.queue_erase(old_15);
+            }
+            let mav30 = TrainSpeed30::new();
+            mav30.signal_id = sig_id;
+            sc.queue_attach(trn_obj, mav30);
+        }
+    }
+}
+
+// ----------------------------------------------------
+// TÂCHE 2 : LIBÉRATION CANTON
+// ----------------------------------------------------
+pub fn CheckTailTask::task_run(self: &CheckTailTask, ctx: &ControlCtx, sc: &mut SimController) {
+    let empty_train = ID<Train>::empty();
+    
+    if !is_valid(ctx.db.view(self.train_id)) {
+        if let clear_obj &= ctx.db.view(self.signal_to_clear) {
+            let clr = BlockOcc::new(); clr.train_id = empty_train;
+            sc.queue_attach(clear_obj, clr);
+        }
+        return;
+    }
+
+    if let watch_obj &= ctx.db.view(self.signal_to_watch) {
+        let p_watch = watch_obj.forward();
+        if ctx.extrapolator.is_reserving(p_watch, self.train_id) {
+            let nt = CheckTailTask::new();
+            nt.train_id = self.train_id;
+            nt.signal_to_clear = self.signal_to_clear;
+            nt.signal_to_watch = self.signal_to_watch;
+            sc.queue_task_at(nt, ctx.extrapolator.clock_us() + 2000000);
+            return;
+        }
+    }
+
+    if let clear_obj &= ctx.db.view(self.signal_to_clear) {
+        if let occ &= ctx.db.view<BlockOcc>(clear_obj) {
+            if occ.train_id.equals(self.train_id) {
+                let clr2 = BlockOcc::new(); clr2.train_id = empty_train;
+                sc.queue_attach(clear_obj, clr2);
+            }
+        }
+    }
+}
 
 // ----------------------------------------------------
 // BAL FRA
 // ----------------------------------------------------
 pub struct BalFRA extend Signal {
     next_signal: ID<Signal> meta { label: "Signal Suivant", },
-    next_next_signal: ID<Signal> meta { label: "Signal Après Suivant", },
-    enable_a_clignotant: bool meta { label: "Activer Jaune Clignotant", default: false, },
-    enable_r_clignotant: bool meta { label: "Activer Rouge Clignotant", default: false, },
-    force_vcli: bool meta { label: "Forcer Vert Clignotant", default: false, },
-    short_to_next: bool meta { label: "Distance Courte vers Suivant", default: false, },
-    short_to_next_next: bool meta { label: "Distance Courte après Suivant", default: false, },
-    force_reset: bool meta { label: "Réinitialiser Canton", default: false, },
+    enable_a_clignotant: bool meta { label: "Activer Jaune Cli", default: false, },
+    enable_r_clignotant: bool meta { label: "Activer Rouge Cli ", default: false, },
+    force_vcli: bool meta { label: "Forcer Vert Cli ", default: false, },
+    force_reset: bool meta { label: "Reset", default: false, },
 }
 
-// ---------------- CHECK ----------------
-pub fn BalFRA::event_signal_check(
-    self: &BalFRA, ctx: &EventCtx, train: &Train, motion: &Motion,
-    signal: &Signal, sc: &mut SimpleSimController
-): SignalCheck {
-    let empty_train = ID<Train>::empty();
+pub fn BalFRA::event_signal_marker_reserved(self: &BalFRA, db: &DB, signal: &Signal): ID<Train> {
+    return ID<Train>::empty();
+}
 
-    if self.force_reset {
-        let clr = BlockOcc::new();
-        clr.train_id = empty_train;
-        sc.queue_attach(signal, clr);
-        return SignalCheck::Pass;
-    }
+// ---------------- SÉCURITÉ (CHECK) ----------------
+pub fn BalFRA::event_signal_check(self: &BalFRA, ctx: &EventCtx, train: &Train, motion: &Motion, signal: &Signal, sc: &mut SimpleSimController): SignalCheck {
+    if self.force_reset { return SignalCheck::Pass; }
 
     if let occ &= ctx.db.view<BlockOcc>(signal) {
-        if !occ.train_id.equals(empty_train) {
-            if !is_valid(ctx.db.view(occ.train_id)) {
-                let clr2 = BlockOcc::new();
-                clr2.train_id = empty_train;
-                sc.queue_attach(signal, clr2);
-                return SignalCheck::Pass;
+        let empty_train = ID<Train>::empty();
+        if !occ.train_id.equals(empty_train) && !occ.train_id.equals(motion.train_id) {
+            
+            if self.enable_r_clignotant { return SignalCheck::Pass; }
+            
+            if let marked &= ctx.db.view<TrainMarkedStop>(train) {
+                if marked.signal_id.equals(signal.id) { return SignalCheck::Pass; }
             }
-            if !occ.train_id.equals(motion.train_id) { 
-                // Autorisation de franchir le canton occupé si Rouge Clignotant
-                if self.enable_r_clignotant {
-                    return SignalCheck::Pass;
+            
+            if let presence &= motion.presence.get() {
+                let current_speed = as_f64(presence.speed);
+                if current_speed < 0.007 { 
+                    let m = TrainMarkedStop::new();
+                    m.signal_id = signal.id;
+                    sc.queue_attach(train, m); 
                 }
-                return SignalCheck::Stop; 
             }
+            return SignalCheck::Stop;
         }
     }
     return SignalCheck::Pass;
 }
 
-// ---------------- LOOKAHEAD ----------------
-pub fn BalFRA::event_signal_lookahead(
-    self: &BalFRA, ctx: &EventCtx, train: &Train, motion: &Motion,
-    signal: &Signal, train_distance: f64, check: SignalCheck,
-    sc: &mut SimpleSimController, result: &mut SignalLookaheadResult
-) {
-    let empty_sig   = ID<Signal>::empty();
+// ---------------- FREINAGE (LOOKAHEAD) ----------------
+pub fn BalFRA::event_signal_lookahead(self: &BalFRA, ctx: &EventCtx, train: &Train, motion: &Motion, signal: &Signal, train_distance: f64, check: SignalCheck, sc: &mut SimpleSimController, result: &mut SignalLookaheadResult) {
+
     let empty_train = ID<Train>::empty();
-
-    // 1) LIRE LES LIMITATIONS FIXES (Ex: Marche à vue à 15km/h)
-    if let cap0 &= ctx.db.view<TrainSpeedCap>(train) {
-        if !cap0.until_signal.equals(empty_sig) {
-            if result.max_speed <= 0.0 { result.max_speed = cap0.cap_ms; }
-            else if result.max_speed > cap0.cap_ms { result.max_speed = cap0.cap_ms; }
-        }
-    }
-
-    // 2) LECTURE DES COURBES D'APPROCHE
-    let has_rcli_curve mut= false;
-    if let rcli_curve &= ctx.db.view<RcliCurve>(train) {
-        if rcli_curve.target_signal.equals(signal.id) {
-            has_rcli_curve = true;
-            
-            let decel_f32_rc = train.as_purchased.max_regular_braking;
-            let decel_f64_rc = as_f64(decel_f32_rc);
-            let safe_decel_rc = decel_f64_rc * 0.7; 
-
-            let target_ms_rc mut= SPEED_15_MS;
-            
-            // Courbe pour viser 15 km/h à 50m
-            if train_distance > RCLI_TARGET_DIST {
-                let dist_to_brake_rc = train_distance - RCLI_TARGET_DIST;
-                let v0_sq_rc = SPEED_15_MS * SPEED_15_MS;
-                let ad2_rc = 2.0 * safe_decel_rc * dist_to_brake_rc;
-                let v2_rc = v0_sq_rc + ad2_rc;
-                target_ms_rc = sqrt(v2_rc); 
-            }
-            
-            if target_ms_rc > SPEED_160_MS { target_ms_rc = SPEED_160_MS; }
-            
-            if result.max_speed <= 0.0 { result.max_speed = target_ms_rc; }
-            else if result.max_speed > target_ms_rc { result.max_speed = target_ms_rc; }
-            return; 
-        }
-    }
-
-    if !has_rcli_curve {
-        if let curve &= ctx.db.view<KvbCurve>(train) {
-            if curve.target_signal.equals(signal.id) {
-                
-                let decel_f32 = train.as_purchased.max_regular_braking;
-                let decel_f64 = as_f64(decel_f32);
-                let safe_decel = decel_f64 * 0.7; 
-
-                let target_ms mut= SPEED_30_MS;
-                
-                // Courbe pour viser 30 km/h à 300m
-                if train_distance > KVB_TARGET_DIST {
-                    let dist_to_brake = train_distance - KVB_TARGET_DIST;
-                    let v0_sq = SPEED_30_MS * SPEED_30_MS;
-                    let ad2 = 2.0 * safe_decel * dist_to_brake;
-                    let v2 = v0_sq + ad2;
-                    target_ms = sqrt(v2); 
-                }
-                
-                if target_ms > SPEED_160_MS { target_ms = SPEED_160_MS; }
-                
-                if result.max_speed <= 0.0 { result.max_speed = target_ms; }
-                else if result.max_speed > target_ms { result.max_speed = target_ms; }
-                return; 
-            }
-        }
-    }
-
-    // 3) SECURITE ABSOLUE (Au pied du signal occupé sans courbe)
-    if let occ_self &= ctx.db.view<BlockOcc>(signal) {
-        if !occ_self.train_id.equals(empty_train) {
-            if !occ_self.train_id.equals(motion.train_id) {
-                if self.enable_r_clignotant {
-                    if train_distance < 100.0 {
-                        if result.max_speed <= 0.0 { result.max_speed = SPEED_15_MS; }
-                        else if result.max_speed > SPEED_15_MS { result.max_speed = SPEED_15_MS; }
-                    }
-                } else {
-                    if train_distance < 300.0 {
-                        if result.max_speed <= 0.0 { result.max_speed = SPEED_30_MS; }
-                        else if result.max_speed > SPEED_30_MS { result.max_speed = SPEED_30_MS; }
-                    }
-                }
-                return;
-            }
-        }
-    }
+    let empty_sig = ID<Signal>::empty();
     
-    // 4) GESTION VCLI ET TOPO
-    let speed_ms mut= 0.0;
-    if let presence &= motion.presence.get() { speed_ms = presence.speed; }
-
-    let vcli_fast mut= false;
-    if speed_ms > SPEED_160_MS + SPEED_EPS_MS { vcli_fast = true; }
-
-    if let vcli &= ctx.db.view<SignalVcli>(signal) {
-        if !is_valid(ctx.db.view(vcli.train_id)) { sc.queue_erase(vcli); }
+    // LA SOLUTION EST ICI : Les return; empêchent le train de "regarder au-delà"
+    // et verrouillent la vitesse à 15 ou 30 km/h.
+    if let m15 &= ctx.db.view<TrainSpeed15>(train) {
+        if result.max_speed <= 0.0 || result.max_speed > SPEED_15_MS { result.max_speed = SPEED_15_MS; }
+        return; 
     }
-    if vcli_fast {
-        let need_attach mut= true;
-        if let vcli2 &= ctx.db.view<SignalVcli>(signal) {
-            if vcli2.train_id.equals(motion.train_id) { need_attach = false; }
+    if let m30 &= ctx.db.view<TrainSpeed30>(train) {
+        if result.max_speed <= 0.0 || result.max_speed > SPEED_30_MS { result.max_speed = SPEED_30_MS; }
+        return; 
+    }
+    if let cap &= ctx.db.view<TrainSpeedCap>(train) {
+        if result.max_speed <= 0.0 || result.max_speed > cap.cap_ms { result.max_speed = cap.cap_ms; }
+    }
+
+    let occ0 mut= false; let occ1 mut= false; let occ2 mut= false;
+
+    let sig1 = self.next_signal;
+    let sig2 mut= empty_sig;
+
+    if let o0 &= ctx.db.view<BlockOcc>(signal) { if !o0.train_id.equals(empty_train) && !o0.train_id.equals(motion.train_id) { occ0 = true; } }
+    
+    if !sig1.equals(empty_sig) {
+        if let s1 &= ctx.db.view(sig1) { 
+            if let o1 &= ctx.db.view<BlockOcc>(s1) { if !o1.train_id.equals(empty_train) { occ1 = true; } }
+            if let b1 &= ctx.db.view<BalFRA>(s1) { sig2 = b1.next_signal; }
         }
-        if need_attach {
-            let vcli3 = SignalVcli::new();
-            vcli3.train_id = motion.train_id;
-            sc.queue_attach(signal, vcli3);
+    }
+    if !sig2.equals(empty_sig) {
+        if let s2 &= ctx.db.view(sig2) { 
+            if let o2 &= ctx.db.view<BlockOcc>(s2) { if !o2.train_id.equals(empty_train) { occ2 = true; } }
+        }
+    }
+
+    let decel = as_f64(train.as_purchased.max_regular_braking) * 0.4;
+    let target mut= 999.0;
+
+    if occ0 {
+        if self.enable_r_clignotant { 
+            let dist_r = max(0.0, train_distance - RCLI_TARGET_DIST);
+            target = sqrt((SPEED_15_MS * SPEED_15_MS) + (2.0 * decel * dist_r)); 
+        } else {
+            let marked_this mut= false;
+            if let marked &= ctx.db.view<TrainMarkedStop>(train) {
+                if marked.signal_id.equals(signal.id) { marked_this = true; }
+            }
+            if marked_this {
+                target = SPEED_30_MS; 
+            } else {
+                target = sqrt(0.01 + (2.0 * decel * train_distance));
+            }
+        }
+    } else if occ1 {
+        let dist_k = max(0.0, train_distance - KVB_TARGET_DIST);
+        target = sqrt((SPEED_30_MS * SPEED_30_MS) + (2.0 * decel * dist_k));
+    } else if occ2 {
+        if self.enable_a_clignotant { target = sqrt((SPEED_90_MS * SPEED_90_MS) + (2.0 * decel * train_distance)); }
+        else if self.force_vcli { target = sqrt((SPEED_160_MS * SPEED_160_MS) + (2.0 * decel * train_distance)); }
+    }
+
+    if target < 998.0 {
+        if result.max_speed <= 0.0 || result.max_speed > target { result.max_speed = target; }
+    }
+}
+
+// ---------------- PASSAGE (PASS BY) ----------------
+pub fn BalFRA::event_signal_pass_by(self: &BalFRA, ctx: &EventCtx, train: &Train, motion: &Motion, signal: &Signal, sc: &mut SimController) {
+
+    let empty_train = ID<Train>::empty();
+    let empty_sig = ID<Signal>::empty();
+    let my_id = motion.train_id;
+
+    if let old_cap &= ctx.db.view<TrainSpeedCap>(train) { sc.queue_erase(old_cap); }
+    if let old_15 &= ctx.db.view<TrainSpeed15>(train) { sc.queue_erase(old_15); }
+    if let old_30 &= ctx.db.view<TrainSpeed30>(train) { sc.queue_erase(old_30); }
+    if let m_stop &= ctx.db.view<TrainMarkedStop>(train) { sc.queue_erase(m_stop); } 
+
+    let is_occ mut= false;
+    let occ1 mut= false;
+    let occ2 mut= false;
+
+    let sig1 = self.next_signal;
+    let sig2 mut= empty_sig;
+
+    if let o &= ctx.db.view<BlockOcc>(signal) { if !o.train_id.equals(empty_train) && !o.train_id.equals(my_id) { is_occ = true; } }
+    
+    if !sig1.equals(empty_sig) {
+        if let s1_obj &= ctx.db.view(sig1) {
+            if let o1 &= ctx.db.view<BlockOcc>(s1_obj) { if !o1.train_id.equals(empty_train) && !o1.train_id.equals(my_id) { occ1 = true; } }
+            if let b1 &= ctx.db.view<BalFRA>(s1_obj) { sig2 = b1.next_signal; }
+        }
+    }
+    if !sig2.equals(empty_sig) {
+        if let s2_obj &= ctx.db.view(sig2) {
+            if let o2 &= ctx.db.view<BlockOcc>(s2_obj) { if !o2.train_id.equals(empty_train) && !o2.train_id.equals(my_id) { occ2 = true; } }
+        }
+    }
+
+    let kmh_to_ms_val = 1.0;
+    let cur_ms mut= 999999.0;
+    let pcur = signal.forward();
+    if let trc &= ctx.db.view(pcur.track_id) { cur_ms = trc.max_speed() * kmh_to_ms_val; }
+
+    if is_occ {
+        if self.enable_r_clignotant {
+            let mav15 = TrainSpeed15::new();
+            mav15.signal_id = signal.id;
+            sc.queue_attach(train, mav15);
+            
+            let ct = CheckClearTask::new();
+            ct.train_id = my_id; ct.signal_id = signal.id;
+            sc.queue_task(ct);
+        } else {
+            let mav30 = TrainSpeed30::new();
+            mav30.signal_id = signal.id;
+            sc.queue_attach(train, mav30);
         }
     } else {
-        if let vcli4 &= ctx.db.view<SignalVcli>(signal) {
-            if vcli4.train_id.equals(motion.train_id) { sc.queue_erase(vcli4); }
+        let new_cap_ms mut= 0.0;
+        if occ1 && self.enable_a_clignotant { new_cap_ms = SPEED_90_MS; }
+        else if self.force_vcli || (occ2 && cur_ms > SPEED_160_MS + 0.01) { new_cap_ms = SPEED_160_MS; }
+
+        if new_cap_ms > 0.0 {
+            let cap = TrainSpeedCap::new();
+            cap.cap_ms = new_cap_ms;
+            sc.queue_attach(train, cap);
         }
     }
 
-    let next_id = self.next_signal;
-    let next_is_occ mut= false;
-    if !next_id.equals(empty_sig) {
-        if let next_sig &= ctx.db.view(next_id) {
-            if let occ_next &= ctx.db.view<BlockOcc>(next_sig) {
-                if !occ_next.train_id.equals(empty_train) { next_is_occ = true; }
-            }
-        }
-    }
-
-    let next_next_occ mut= false;
-    let nn_id = self.next_next_signal;
-    if !nn_id.equals(empty_sig) {
-        if let nn_sig &= ctx.db.view(nn_id) {
-            if let occ_nn &= ctx.db.view<BlockOcc>(nn_sig) {
-                if !occ_nn.train_id.equals(empty_train) { next_next_occ = true; }
-            }
-        }
-    }
-
-    let cur_ms mut= 999999.0;
-    let next_ms mut= 999999.0;
-    let pcur = signal.forward();
-    if let trc &= ctx.db.view(pcur.track_id) { cur_ms = trc.max_speed() * KMH_TO_MS; }
-    
-    if !next_id.equals(empty_sig) {
-        if let next_sig_obj &= ctx.db.view(next_id) {
-            let pnext = next_sig_obj.forward();
-            if let trn &= ctx.db.view(pnext.track_id) { next_ms = trn.max_speed() * KMH_TO_MS; }
-        }
-    }
-
-    let enters_160 mut= false;
-    if cur_ms > SPEED_160_MS + SPEED_EPS_MS {
-        if next_ms <= SPEED_160_MS + SPEED_EPS_MS {
-            enters_160 = true;
-        }
-    }
-
-    let annonce_a_160 mut= false;
-    if next_next_occ {
-        if next_ms > SPEED_160_MS + SPEED_EPS_MS {
-            annonce_a_160 = true;
-        }
-    }
-
-    let topo_160 mut= false;
-    if enters_160 { topo_160 = true; }
-    if annonce_a_160 { topo_160 = true; }
-
-    if topo_160 {
-        if speed_ms > SPEED_160_MS + SPEED_EPS_MS {
-            if train_distance < DIST_160_ARM_M {
-                if !next_id.equals(empty_sig) {
-                    let need_attach160 mut= true;
-                    if let cap_old160 &= ctx.db.view<TrainSpeedCap>(train) {
-                        let is_same_id mut= false;
-                        if cap_old160.until_signal.equals(next_id) {
-                            if cap_old160.cap_ms == SPEED_160_MS {
-                                is_same_id = true;
-                            }
-                        }
-                        if is_same_id {
-                            need_attach160 = false;
-                        } else {
-                            sc.queue_erase(cap_old160);
-                        }
-                    }
-                    if need_attach160 {
-                        let cap160 = TrainSpeedCap::new();
-                        cap160.until_signal = next_id;
-                        cap160.cap_ms = SPEED_160_MS;
-                        sc.queue_attach(train, cap160);
-                    }
-                }
-                if result.max_speed <= 0.0 { result.max_speed = SPEED_160_MS; }
-                else if result.max_speed > SPEED_160_MS { result.max_speed = SPEED_160_MS; }
-            }
-        }
-    }
-}
-
-// ---------------- PASS BY ----------------
-pub fn BalFRA::event_signal_pass_by(
-    self: &BalFRA, ctx: &EventCtx, train: &Train, motion: &Motion,
-    signal: &Signal, sc: &mut SimController
-) {
-    let empty_sig   = ID<Signal>::empty();
-    let empty_train = ID<Train>::empty();
-
-    // 1. Nettoyage
-    if let cap &= ctx.db.view<TrainSpeedCap>(train) {
-        let erase_cap mut= false;
-        if cap.until_signal.equals(signal.id) { erase_cap = true; }
-        if cap.until_signal.equals(empty_sig) { erase_cap = true; }
-        if !is_valid(ctx.db.view(cap.until_signal)) { erase_cap = true; }
-        if erase_cap { sc.queue_erase(cap); }
-    }
-    
-    if let old_curve &= ctx.db.view<KvbCurve>(train) { sc.queue_erase(old_curve); }
-    if let old_rcli &= ctx.db.view<RcliCurve>(train) { sc.queue_erase(old_rcli); }
-    if let vcli &= ctx.db.view<SignalVcli>(signal) {
-        if vcli.train_id.equals(motion.train_id) { sc.queue_erase(vcli); }
-    }
-
-    let next_id = self.next_signal;
-
-    // 2. Si le train PENETRE dans le canton OCCUPÉ (franchissement Rouge Cli) -> Vitesse plafonnée à 15km/h
-    let entering_occupied mut= false;
-    if let occ_now &= ctx.db.view<BlockOcc>(signal) {
-        if !occ_now.train_id.equals(empty_train) {
-            if !occ_now.train_id.equals(motion.train_id) {
-                entering_occupied = true;
-            }
-        }
-    }
-    if entering_occupied {
-        if !next_id.equals(empty_sig) {
-            let new_cap = TrainSpeedCap::new();
-            new_cap.until_signal = next_id;
-            new_cap.cap_ms = SPEED_15_MS;
-            sc.queue_attach(train, new_cap);
-        }
-    }
-
-    // 3. Lire le futur pour armer les courbes d'approche
-    let next_is_occ mut= false;
-    let next_is_rcli mut= false;
-
-    if !next_id.equals(empty_sig) {
-        if let next_sig &= ctx.db.view(next_id) {
-            if let occ_next &= ctx.db.view<BlockOcc>(next_sig) {
-                if !occ_next.train_id.equals(empty_train) { 
-                    next_is_occ = true; 
-                    if let next_bal &= ctx.db.view<BalFRA>(next_sig) {
-                        if next_bal.enable_r_clignotant { next_is_rcli = true; }
-                    }
-                }
-            }
-        }
-    }
-
-    let next_next_occ mut= false;
-    let nn_id = self.next_next_signal;
-    if !nn_id.equals(empty_sig) {
-        if let nn_sig &= ctx.db.view(nn_id) {
-            if let occ_nn &= ctx.db.view<BlockOcc>(nn_sig) {
-                if !occ_nn.train_id.equals(empty_train) { next_next_occ = true; }
-            }
-        }
-    }
-
-    // 4. Appliquer les ordres
-    if !next_id.equals(empty_sig) {
-        if next_is_occ {
-            if next_is_rcli {
-                let rcli = RcliCurve::new();
-                rcli.target_signal = next_id;
-                sc.queue_attach(train, rcli);
-            } else {
-                let kvb = KvbCurve::new();
-                kvb.target_signal = next_id;
-                sc.queue_attach(train, kvb);
-            }
-        } else if self.enable_a_clignotant && next_next_occ {
-            let acli = TrainSpeedCap::new();
-            acli.until_signal = next_id;
-            acli.cap_ms = SPEED_90_MS;
-            sc.queue_attach(train, acli);
-        } else {
-            let cur_ms mut= 999999.0;
-            let pcur = signal.forward();
-            if let trc &= ctx.db.view(pcur.track_id) { cur_ms = trc.max_speed() * KMH_TO_MS; }
-            
-            let vcli_should mut= false;
-            if self.force_vcli { vcli_should = true; }
-            if cur_ms > SPEED_160_MS + SPEED_EPS_MS {
-                if next_next_occ { vcli_should = true; }
-            }
-
-            if vcli_should {
-                let vcap = TrainSpeedCap::new();
-                vcap.until_signal = next_id;
-                vcap.cap_ms = SPEED_160_MS;
-                sc.queue_attach(train, vcap);
-            }
-        }
-    }
-
-    // 5. Gestion de l'occupation
     if let last &= ctx.db.view<TrainLast>(train) {
-        let prev_id = last.prev;
-        if !prev_id.equals(empty_sig) {
-            if let prev_sig &= ctx.db.view(prev_id) {
-                if let occ_prev &= ctx.db.view<BlockOcc>(prev_sig) {
-                    if occ_prev.train_id.equals(motion.train_id) {
-                        let clr = BlockOcc::new();
-                        clr.train_id = empty_train;
-                        sc.queue_attach(prev_sig, clr);
-                    }
-                }
-            }
+        let prev = last.prev_signal;
+        if !prev.equals(empty_sig) {
+            let task = CheckTailTask::new();
+            task.train_id = my_id; 
+            task.signal_to_clear = prev; 
+            task.signal_to_watch = signal.id;
+            sc.queue_task_at(task, ctx.extrapolator.clock_us() + 1000000);
         }
     }
-
-    let occ = BlockOcc::new();
-    occ.train_id = motion.train_id;
-    sc.queue_attach(signal, occ);
-
-    let tl = TrainLast::new();
-    tl.prev = signal.id;
-    sc.queue_attach(train, tl);
+    let nl = TrainLast::new(); nl.prev_signal = signal.id; sc.queue_attach(train, nl);
+    let occ = BlockOcc::new(); occ.train_id = my_id; sc.queue_attach(signal, occ);
 }
 
-// ---------------- TEXTURE STATE ----------------
-pub fn BalFRA::event_signal_texture_state(
-    self: &BalFRA, db: &DB, signal: &Signal, clock_us: i64, core_state : i64
-): i64 {
+// ---------------- VISUEL (TEXTURES) ----------------
+pub fn BalFRA::event_signal_texture_state(self: &BalFRA, db: &DB, signal: &Signal, clock_us: i64, core_state : i64): i64 {
+    if self.force_reset { return 0; }
+    
     let empty_train = ID<Train>::empty();
-    let empty_sig   = ID<Signal>::empty();
+    let empty_sig = ID<Signal>::empty();
 
-    // 1. SIGNAL ACTUEL PROTEGE UN CANTON OCCUPÉ (Rouge ou Rouge Clignotant)
     if let occ &= db.view<BlockOcc>(signal) {
-        if !occ.train_id.equals(empty_train) { 
+        if !occ.train_id.equals(empty_train) {
             if self.enable_r_clignotant {
-                let ph = zmod(zdiv(clock_us, BLINK_US), 2);
-                if ph == 0 { return 7; } 
-                return 8;                
+                let tick_r = zmod(zdiv(clock_us, BLINK_US), 2);
+                if tick_r == 0 { return 7; }
+                return 8;
             }
-            return 1; 
+            return 1;
         }
     }
 
-    let next_id = self.next_signal;
-    let next_is_occ mut= false;
+    let n_occ mut= false; 
+    let nn_occ mut= false;
+    
+    let sig1 = self.next_signal;
+    let sig2 mut= empty_sig;
 
-    if !next_id.equals(empty_sig) {
-        if let next_sig &= db.view(next_id) {
-            if let occ2 &= db.view<BlockOcc>(next_sig) {
-                if !occ2.train_id.equals(empty_train) { next_is_occ = true; }
-            }
+    if !sig1.equals(empty_sig) {
+        if let s1 &= db.view(sig1) {
+            if let o1 &= db.view<BlockOcc>(s1) { if !o1.train_id.equals(empty_train) { n_occ = true; } }
+            if let b1 &= db.view<BalFRA>(s1) { sig2 = b1.next_signal; }
+        }
+    }
+    if !sig2.equals(empty_sig) {
+        if let s2 &= db.view(sig2) {
+            if let o2 &= db.view<BlockOcc>(s2) { if !o2.train_id.equals(empty_train) { nn_occ = true; } }
         }
     }
 
-    // 2. LE PROCHAIN SIGNAL EST FERME (Jaune d'Avertissement)
-    if next_is_occ { return 2; } 
-
-    let next_next_occ mut= false;
-    let nn_id = self.next_next_signal;
-    if !nn_id.equals(empty_sig) {
-        if let nn_sig &= db.view(nn_id) {
-            if let occ3 &= db.view<BlockOcc>(nn_sig) {
-                if !occ3.train_id.equals(empty_train) { next_next_occ = true; }
-            }
-        }
-    }
-
-    // 3. LE SIGNAL D'APRES EST FERME (Jaune Clignotant si activé)
-    if next_next_occ {
+    if n_occ { return 2; }
+    
+    if nn_occ {
         if self.enable_a_clignotant {
-            let ph2 = zmod(zdiv(clock_us, BLINK_US), 2);
-            if ph2 == 0 { return 6; } 
+            let tick_j = zmod(zdiv(clock_us, BLINK_US), 2);
+            if tick_j == 0 { return 6; }
             return 5;
         }
+        if self.force_vcli {
+            let tick_v = zmod(zdiv(clock_us, BLINK_US), 2);
+            if tick_v == 0 { return 4; }
+            return 3;
+        }
     }
 
-    // 4. PRE ANNONCE HAUTE VITESSE (Vert Clignotant)
-    let cur_ms mut= 999999.0;
-    let pcur = signal.forward();
-    if let trc &= db.view(pcur.track_id) { cur_ms = trc.max_speed() * KMH_TO_MS; }
-
-    let vcli_should mut= false;
-    if self.force_vcli { vcli_should = true; }
-    if cur_ms > SPEED_160_MS + SPEED_EPS_MS {
-        if next_next_occ { vcli_should = true; }
-    }
-
-    if vcli_should {
-        let ph4 = zmod(zdiv(clock_us, BLINK_US), 2);
-        if ph4 == 0 { return 4; } 
-        return 3;                 
-    }
-
-    // 5. VOIE LIBRE (Vert Fixe)
-    return 0; 
+    return 0;
 }

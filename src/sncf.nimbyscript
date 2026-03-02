@@ -3,8 +3,8 @@ script meta {
     api: nimbyrails.v1,
     description: [
         "SNCF BAL & Cible Type C",
-        "Type A : BAL Classique avec KVB et Stop & Proceed.",
-        "Type C : Protection PAI, Carré/Violet et Blanc de Manoeuvre (par Ligne).",
+        "Type A : BAL Classique avec KVB.",
+        "Type C : Protection PAI, Carré/Violet et Blanc de Manoeuvre (RADAR + MÉMOIRE 120s).",
     ],
 }
 
@@ -13,7 +13,7 @@ const SPEED_15_MS:  f64 = 4.166666666666667;
 const SPEED_30_MS:  f64 = 8.333333333333334;
 const SPEED_90_MS:  f64 = 25.0;
 const SPEED_160_MS: f64 = 44.44444444444444;
-const BLINK_US:     i64 = 3000000; 
+const BLINK_US:     i64 = 500000; 
 
 const KVB_TARGET_DIST: f64 = 300.0;
 const RCLI_TARGET_DIST: f64 = 50.0; 
@@ -136,16 +136,12 @@ pub fn BalFRA::event_signal_check(self: &BalFRA, ctx: &EventCtx, train: &Train, 
     if let occ &= ctx.db.view<BlockOcc>(signal) {
         let empty_train = ID<Train>::empty();
         if !occ.train_id.equals(empty_train) && !occ.train_id.equals(motion.train_id) {
-            
             if self.enable_r_clignotant { return SignalCheck::Pass; }
-            
             if let marked &= ctx.db.view<TrainMarkedStop>(train) {
                 if marked.signal_id.equals(signal.id) { return SignalCheck::Pass; }
             }
-            
             if let presence &= motion.presence.get() {
-                let current_speed = as_f64(presence.speed);
-                if current_speed < 0.007 { 
+                if as_f64(presence.speed) < 0.007 { 
                     let m = TrainMarkedStop::new();
                     m.signal_id = signal.id;
                     sc.queue_attach(train, m); 
@@ -174,7 +170,6 @@ pub fn BalFRA::event_signal_lookahead(self: &BalFRA, ctx: &EventCtx, train: &Tra
     }
 
     let occ0 mut= false; let occ1 mut= false; let occ2 mut= false;
-
     let sig1 = self.next_signal;
     let sig2 mut= empty_sig;
 
@@ -329,8 +324,8 @@ pub fn BalFRA::event_signal_texture_state(self: &BalFRA, db: &DB, signal: &Signa
         if !occ.train_id.equals(empty_train) {
             if self.enable_r_clignotant {
                 let tick_r = zmod(zdiv(clock_us, BLINK_US), 2);
-                if tick_r == 0 { return 7; }
-                return 8;
+                if tick_r == 0 { return 10; }
+                return 9;
             }
             return 1;
         }
@@ -363,7 +358,7 @@ pub fn BalFRA::event_signal_texture_state(self: &BalFRA, db: &DB, signal: &Signa
         }
     }
 
-    if n_occ { return 2; }
+    if n_occ { return 4; }
     
     if nn_occ {
         if self.enable_a_clignotant {
@@ -373,8 +368,8 @@ pub fn BalFRA::event_signal_texture_state(self: &BalFRA, db: &DB, signal: &Signa
         }
         if self.force_vcli {
             let tick_v = zmod(zdiv(clock_us, BLINK_US), 2);
-            if tick_v == 0 { return 4; }
-            return 3;
+            if tick_v == 0 { return 8; }
+            return 7;
         }
     }
     return 0;
@@ -394,9 +389,8 @@ enum ModeCarre {
 pub struct CarreC extend Signal {
     mode: ModeCarre meta { label: "Mode de protection", },
     next_signals: &Vec<ID<Signal>> meta { label: "Voies Principales (Vert/Jaune)", },
-    // NOUVEAU : On utilise ID<Line> pour la pipette de manœuvre !
-    maneuver_main_lines: &Vec<ID<Line>> meta { label: "LIGNES Manoeuvre vers Principale (Blanc Fixe)", },
-    maneuver_service_lines: &Vec<ID<Line>> meta { label: "LIGNES Manoeuvre vers Courte/Tiroir (Blanc Cli)", },
+    maneuver_main_signals: &Vec<ID<Signal>> meta { label: "MARKERS Manoeuvre vers Principale (Blanc Fixe)", },
+    maneuver_service_signals: &Vec<ID<Signal>> meta { label: "MARKERS Manoeuvre vers Courte/Tiroir (Blanc Cli)", },
     enable_a_clignotant: bool meta { label: "Activer Jaune Cli", default: false, },
     enable_r_clignotant: bool meta { label: "Activer Rouge Cli", default: false, },
     force_vcli: bool meta { label: "Forcer Vert Cli", default: false, },
@@ -413,19 +407,99 @@ pub fn CarreC::event_signal_check(self: &CarreC, ctx: &EventCtx, train: &Train, 
     let empty_train = ID<Train>::empty();
     let current_time = ctx.extrapolator.clock_us();
 
-  let is_maneuver_main mut= false;
-    let is_maneuver_service mut= false;
+    let is_man_main mut= false;
+    let is_man_srv mut= false;
 
-    // Détection de la ligne via schedule_dispatch ou run_dispatch
-    if let rd &= motion.run_dispatch.get() {
-        for line_id in self.maneuver_main_lines.iter() {
-            if rd.run.line_id.equals(line_id) { is_maneuver_main = true; }
-        }
-        for line_id in self.maneuver_service_lines.iter() {
-            if rd.run.line_id.equals(line_id) { is_maneuver_service = true; }
+    // RADAR 100 METRES (Check)
+    for sig_id in self.maneuver_main_signals.iter() {
+        if let s1 &= ctx.db.view(sig_id) {
+            let fwd mut= s1.forward();
+            let bwd mut= s1.backward();
+            
+            let res_hit mut= false;
+            if ctx.extrapolator.is_reserving(fwd, motion.train_id) { res_hit = true; }
+            if ctx.extrapolator.is_reserving(bwd, motion.train_id) { res_hit = true; }
+            
+            if res_hit { 
+                is_man_main = true; 
+            } else if let drive &= motion.drive.get() {
+                let pf1 mut= ctx.db.track_pos_project(fwd, 15.0);
+                let pb1 mut= ctx.db.track_pos_project(fwd, -15.0);
+                let pf2 mut= ctx.db.track_pos_project(fwd, 50.0);
+                let pb2 mut= ctx.db.track_pos_project(fwd, -50.0);
+                
+                let trace_hit mut= false;
+                if drive.goal_trace.contains(fwd) { trace_hit = true; }
+                if drive.goal_trace.contains(bwd) { trace_hit = true; }
+                if drive.goal_trace.contains(pf1) { trace_hit = true; }
+                if drive.goal_trace.contains(pb1) { trace_hit = true; }
+                if drive.goal_trace.contains(pf2) { trace_hit = true; }
+                if drive.goal_trace.contains(pb2) { trace_hit = true; }
+                
+                if trace_hit {
+                    is_man_main = true;
+                } else if drive.path.found {
+                    let dt = drive.path.found_goal.track_id;
+                    let dest_hit mut= false;
+                    if dt.equals(fwd.track_id) { dest_hit = true; }
+                    if dt.equals(pf1.track_id) { dest_hit = true; }
+                    if dt.equals(pb1.track_id) { dest_hit = true; }
+                    if dt.equals(pf2.track_id) { dest_hit = true; }
+                    if dt.equals(pb2.track_id) { dest_hit = true; }
+                    
+                    if dest_hit {
+                        is_man_main = true;
+                    }
+                }
+            }
         }
     }
-    let is_maneuver = is_maneuver_main || is_maneuver_service;
+    
+    for sig_id in self.maneuver_service_signals.iter() {
+        if let s1 &= ctx.db.view(sig_id) {
+            let fwd mut= s1.forward();
+            let bwd mut= s1.backward();
+            
+            let res_hit mut= false;
+            if ctx.extrapolator.is_reserving(fwd, motion.train_id) { res_hit = true; }
+            if ctx.extrapolator.is_reserving(bwd, motion.train_id) { res_hit = true; }
+            
+            if res_hit { 
+                is_man_srv = true; 
+            } else if let drive &= motion.drive.get() {
+                let pf1 mut= ctx.db.track_pos_project(fwd, 15.0);
+                let pb1 mut= ctx.db.track_pos_project(fwd, -15.0);
+                let pf2 mut= ctx.db.track_pos_project(fwd, 50.0);
+                let pb2 mut= ctx.db.track_pos_project(fwd, -50.0);
+                
+                let trace_hit mut= false;
+                if drive.goal_trace.contains(fwd) { trace_hit = true; }
+                if drive.goal_trace.contains(bwd) { trace_hit = true; }
+                if drive.goal_trace.contains(pf1) { trace_hit = true; }
+                if drive.goal_trace.contains(pb1) { trace_hit = true; }
+                if drive.goal_trace.contains(pf2) { trace_hit = true; }
+                if drive.goal_trace.contains(pb2) { trace_hit = true; }
+                
+                if trace_hit {
+                    is_man_srv = true;
+                } else if drive.path.found {
+                    let dt = drive.path.found_goal.track_id;
+                    let dest_hit mut= false;
+                    if dt.equals(fwd.track_id) { dest_hit = true; }
+                    if dt.equals(pf1.track_id) { dest_hit = true; }
+                    if dt.equals(pb1.track_id) { dest_hit = true; }
+                    if dt.equals(pf2.track_id) { dest_hit = true; }
+                    if dt.equals(pb2.track_id) { dest_hit = true; }
+                    
+                    if dest_hit {
+                        is_man_srv = true;
+                    }
+                }
+            }
+        }
+    }
+    
+    let is_maneuver = is_man_main || is_man_srv;
 
     let block_is_occ mut= false;
     if let occ &= ctx.db.view<BlockOcc>(signal) {
@@ -450,7 +524,7 @@ pub fn CarreC::event_signal_check(self: &CarreC, ctx: &EventCtx, train: &Train, 
         }
     }
     
-    // SYSTÈME DE CADENAS (JunctionLock) uniquement sur les signaux physiques
+    // SYSTÈME DE CADENAS (JunctionLock)
     if self.mode == ModeCarre::CarreAbsolu || self.mode == ModeCarre::CarreViolet {
         let locked_by_other mut= false;
 
@@ -473,43 +547,152 @@ pub fn CarreC::event_signal_check(self: &CarreC, ctx: &EventCtx, train: &Train, 
         }
     }
 
+    // EFFET MÉMOIRE ANTI-CLIGNOTEMENT (Check)
+    let final_aspect mut= 0;
+    if is_man_main { final_aspect = 1; }
+    else if is_man_srv { final_aspect = 2; }
+    else {
+        // Si on perd la vue du marqueur parce que le train s'est arrêté, on regarde si on s'en souvient !
+        if let old_app &= ctx.db.view<SignalApproach>(signal) {
+            if old_app.train_id.equals(motion.train_id) {
+                final_aspect = old_app.aspect; 
+            }
+        }
+    }
+
     let app = SignalApproach::new();
     app.last_us = current_time;
     app.train_id = motion.train_id;
-    if is_maneuver_main { app.aspect = 1; }
-    else if is_maneuver_service { app.aspect = 2; }
-    else { app.aspect = 0; }
+    app.aspect = final_aspect;
     sc.queue_attach(signal, app);
 
     return SignalCheck::Pass;
 }
+
 pub fn CarreC::event_signal_lookahead(self: &CarreC, ctx: &EventCtx, train: &Train, motion: &Motion, signal: &Signal, train_distance: f64, check: SignalCheck, sc: &mut SimpleSimController, result: &mut SignalLookaheadResult) {
     let empty_train = ID<Train>::empty();
     let empty_sig = ID<Signal>::empty();
     
     if self.mode == ModeCarre::CarreAbsolu || self.mode == ModeCarre::CarreViolet {
-        let is_maneuver_main mut= false;
-        let is_maneuver_service mut= false;
+        let is_man_main mut= false;
+        let is_man_srv mut= false;
         
-        // FIX : On lit l'identifiant de la Ligne directement sur l'objet 'train'
-      if let rd &= motion.run_dispatch.get() {
-            for line_id in self.maneuver_main_lines.iter() {
-                if rd.run.line_id.equals(line_id) { is_maneuver_main = true; }
+        // RADAR 100 METRES (Lookahead)
+        for sig_id in self.maneuver_main_signals.iter() {
+            if let s1 &= ctx.db.view(sig_id) {
+                let fwd mut= s1.forward();
+                let bwd mut= s1.backward();
+                
+                let res_hit mut= false;
+                if ctx.extrapolator.is_reserving(fwd, motion.train_id) { res_hit = true; }
+                if ctx.extrapolator.is_reserving(bwd, motion.train_id) { res_hit = true; }
+                
+                if res_hit { 
+                    is_man_main = true; 
+                } else if let drive &= motion.drive.get() {
+                    let pf1 mut= ctx.db.track_pos_project(fwd, 15.0);
+                    let pb1 mut= ctx.db.track_pos_project(fwd, -15.0);
+                    let pf2 mut= ctx.db.track_pos_project(fwd, 50.0);
+                    let pb2 mut= ctx.db.track_pos_project(fwd, -50.0);
+                    
+                    let trace_hit mut= false;
+                    if drive.goal_trace.contains(fwd) { trace_hit = true; }
+                    if drive.goal_trace.contains(bwd) { trace_hit = true; }
+                    if drive.goal_trace.contains(pf1) { trace_hit = true; }
+                    if drive.goal_trace.contains(pb1) { trace_hit = true; }
+                    if drive.goal_trace.contains(pf2) { trace_hit = true; }
+                    if drive.goal_trace.contains(pb2) { trace_hit = true; }
+                    
+                    if trace_hit {
+                        is_man_main = true;
+                    } else if drive.path.found {
+                        let dt = drive.path.found_goal.track_id;
+                        let dest_hit mut= false;
+                        if dt.equals(fwd.track_id) { dest_hit = true; }
+                        if dt.equals(pf1.track_id) { dest_hit = true; }
+                        if dt.equals(pb1.track_id) { dest_hit = true; }
+                        if dt.equals(pf2.track_id) { dest_hit = true; }
+                        if dt.equals(pb2.track_id) { dest_hit = true; }
+                        
+                        if dest_hit {
+                            is_man_main = true;
+                        }
+                    }
+                }
             }
-            for line_id in self.maneuver_service_lines.iter() {
-                if rd.run.line_id.equals(line_id) { is_maneuver_service = true; }
+        }
+        
+        for sig_id in self.maneuver_service_signals.iter() {
+            if let s1 &= ctx.db.view(sig_id) {
+                let fwd mut= s1.forward();
+                let bwd mut= s1.backward();
+                
+                let res_hit mut= false;
+                if ctx.extrapolator.is_reserving(fwd, motion.train_id) { res_hit = true; }
+                if ctx.extrapolator.is_reserving(bwd, motion.train_id) { res_hit = true; }
+                
+                if res_hit { 
+                    is_man_srv = true; 
+                } else if let drive &= motion.drive.get() {
+                    let pf1 mut= ctx.db.track_pos_project(fwd, 15.0);
+                    let pb1 mut= ctx.db.track_pos_project(fwd, -15.0);
+                    let pf2 mut= ctx.db.track_pos_project(fwd, 50.0);
+                    let pb2 mut= ctx.db.track_pos_project(fwd, -50.0);
+                    
+                    let trace_hit mut= false;
+                    if drive.goal_trace.contains(fwd) { trace_hit = true; }
+                    if drive.goal_trace.contains(bwd) { trace_hit = true; }
+                    if drive.goal_trace.contains(pf1) { trace_hit = true; }
+                    if drive.goal_trace.contains(pb1) { trace_hit = true; }
+                    if drive.goal_trace.contains(pf2) { trace_hit = true; }
+                    if drive.goal_trace.contains(pb2) { trace_hit = true; }
+                    
+                    if trace_hit {
+                        is_man_srv = true;
+                    } else if drive.path.found {
+                        let dt = drive.path.found_goal.track_id;
+                        let dest_hit mut= false;
+                        if dt.equals(fwd.track_id) { dest_hit = true; }
+                        if dt.equals(pf1.track_id) { dest_hit = true; }
+                        if dt.equals(pb1.track_id) { dest_hit = true; }
+                        if dt.equals(pf2.track_id) { dest_hit = true; }
+                        if dt.equals(pb2.track_id) { dest_hit = true; }
+                        
+                        if dest_hit {
+                            is_man_srv = true;
+                        }
+                    }
+                }
             }
         }
 
-        let app = SignalApproach::new();
-        app.last_us = ctx.extrapolator.clock_us();
-        app.train_id = motion.train_id;
+        // GESTION DES CONFLITS D'APPROCHE & MÉMOIRE (120 SECONDES !)
+        let is_closest mut= true;
+        let old_aspect mut= 0;
+        let has_old_app mut= false;
+
+        if let current_app &= ctx.db.view<SignalApproach>(signal) {
+            // Un autre train a cliqué sur le signal, on verrouille pendant 120s (120 000 000 us) !
+            if !current_app.train_id.equals(motion.train_id) && (ctx.extrapolator.clock_us() - current_app.last_us < 120000000) {
+                is_closest = false;
+            } else if current_app.train_id.equals(motion.train_id) {
+                old_aspect = current_app.aspect;
+                has_old_app = true;
+            }
+        }
         
-        if is_maneuver_main { app.aspect = 1; } 
-        else if is_maneuver_service { app.aspect = 2; } 
-        else { app.aspect = 0; } 
-        
-        sc.queue_attach(signal, app);
+        if is_closest {
+            let final_aspect mut= 0;
+            if is_man_main { final_aspect = 1; } 
+            else if is_man_srv { final_aspect = 2; } 
+            else if has_old_app { final_aspect = old_aspect; } // On restaure la mémoire !
+
+            let app = SignalApproach::new();
+            app.last_us = ctx.extrapolator.clock_us();
+            app.train_id = motion.train_id;
+            app.aspect = final_aspect;
+            sc.queue_attach(signal, app);
+        }
     }
     
     if let m15 &= ctx.db.view<TrainSpeed15>(train) {
@@ -584,6 +767,7 @@ pub fn CarreC::event_signal_lookahead(self: &CarreC, ctx: &EventCtx, train: &Tra
         if result.max_speed <= 0.0 || result.max_speed > target { result.max_speed = target; }
     }
 }
+
 pub fn CarreC::event_signal_pass_by(self: &CarreC, ctx: &EventCtx, train: &Train, motion: &Motion, signal: &Signal, sc: &mut SimController) {
     let empty_train = ID<Train>::empty();
     let empty_sig = ID<Signal>::empty();
@@ -598,6 +782,9 @@ pub fn CarreC::event_signal_pass_by(self: &CarreC, ctx: &EventCtx, train: &Train
     if let old_30 &= ctx.db.view<TrainSpeed30>(train) { sc.queue_erase(old_30); }
     if let m_stop &= ctx.db.view<TrainMarkedStop>(train) { sc.queue_erase(m_stop); } 
     
+    // ========================================================
+    // DESTRUCTION DE L'ITINÉRAIRE : LE TRAIN FRANCHIT LE FEU !
+    // ========================================================
     if let app &= ctx.db.view<SignalApproach>(signal) { sc.queue_erase(app); }
 
     let is_occ mut= false;
@@ -676,55 +863,94 @@ pub fn CarreC::event_signal_texture_state(self: &CarreC, db: &DB, signal: &Signa
     if self.force_reset { return 0; }
     
     let empty_train = ID<Train>::empty();
-    let is_approached mut= false;
-    let aspect mut= 0;
+    let empty_sig = ID<Signal>::empty();
     
+    // 1. LECTURE DE LA DEMANDE DE ROUTE (Le "Réveil" du signal par la mémoire)
+    let is_app mut= false;
+    let aspect mut= 0;
+    let my_train mut= empty_train;
     if let app &= db.view<SignalApproach>(signal) {
-        if clock_us - app.last_us < 10000000 { 
-            is_approached = true; 
+        // La mémoire dure 120 secondes !
+        // Si le train passe le feu, le script "pass_by" effacera cette mémoire pour fermer.
+        if clock_us - app.last_us < 120000000 { 
+            is_app = true; 
             aspect = app.aspect;
+            my_train = app.train_id;
         }
     }
 
-    if core_state != 0 || (!is_approached && (self.mode == ModeCarre::CarreAbsolu || self.mode == ModeCarre::CarreViolet)) {
-        if self.mode == ModeCarre::CarreAbsolu { return 2; } 
-        if self.mode == ModeCarre::CarreViolet { return 3; } 
-        return 1; 
+    // 2. DÉFINITION DE L'ÉTAT FERMÉ (Le signal au repos)
+    let closed_state mut= 1; // Sémaphore par défaut
+    if self.mode == ModeCarre::CarreViolet {
+        closed_state = 3; // Carré Violet reste toujours Violet fermé
+    } else if self.mode == ModeCarre::CarreAbsolu {
+        if is_app && (aspect == 1 || aspect == 2) {
+            closed_state = 3; // Si le train a demandé une manœuvre, l'état fermé devient temporairement Violet !
+        } else {
+            closed_state = 2; // Sinon (ou au repos), c'est le double Rouge
+        }
     }
 
+    // 3. VÉRIFICATION DES CONFLITS (Cadenas d'Aiguillage)
+    let locked_by_other mut= false;
+    if self.mode == ModeCarre::CarreAbsolu || self.mode == ModeCarre::CarreViolet {
+        for sig_id in self.next_signals.iter() {
+            if let s1 &= db.view(sig_id) {
+                if let lock &= db.view<JunctionLock>(s1) {
+                    if !lock.train_id.equals(empty_train) {
+                        let lock_is_not_mine = !lock.train_id.equals(my_train);
+                        if lock_is_not_mine && (clock_us < lock.expires_us) { 
+                            locked_by_other = true; 
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. RÈGLE DU "NORMALEMENT FERMÉ"
+    // Si la route est bloquée par un autre train, OU s'il n'y a AUCUN train qui approche pour réveiller le signal
+    if locked_by_other || (!is_app && self.mode != ModeCarre::Semaphore) {
+        return closed_state; 
+    }
+
+    // 5. PRÉSENCE PHYSIQUE (Le canton immédiat derrière le signal est occupé)
     if let occ &= db.view<BlockOcc>(signal) {
         if !occ.train_id.equals(empty_train) {
             if self.enable_r_clignotant {
-                if zmod(zdiv(clock_us, BLINK_US), 2) == 0 { return 9; }
-                return 10;
+                if zmod(zdiv(clock_us, BLINK_US), 2) == 0 { return 10; }
+                return 9;
             }
-            if self.mode == ModeCarre::CarreAbsolu { return 2; } 
-            if self.mode == ModeCarre::CarreViolet { return 3; } 
-            return 1; 
+            return closed_state;
         }
     }
 
-    if aspect == 1 { 
-        if self.next_signals.len() == 0 && self.mode == ModeCarre::CarreViolet { return 11; }
-        return 11; 
-    } 
-    if aspect == 2 {
-        if self.next_signals.len() == 0 && self.mode == ModeCarre::CarreViolet { 
-           if zmod(zdiv(clock_us, BLINK_US), 2) == 0 { return 12; } else { return 13; }
+    // =========================================================================
+    // SI ON ARRIVE ICI : LE TRAIN A RÉVEILLÉ LE SIGNAL ET LA VOIE EST LIBRE !
+    // =========================================================================
+
+    // 6. AFFICHAGE DES FEUX BLANCS (Manœuvre validée)
+    if is_app {
+        if aspect == 1 { return 11; } 
+        if aspect == 2 {
+            if zmod(zdiv(clock_us, BLINK_US), 2) == 0 { return 13; } else { return 12; }
         }
-        if zmod(zdiv(clock_us, BLINK_US), 2) == 0 { return 12; } 
-        return 13; 
     }
 
+    // SÉCURITÉ ABSOLUE DU CARRÉ VIOLET (Il ne peut JAMAIS s'ouvrir en Vert/Jaune)
+    if self.mode == ModeCarre::CarreViolet {
+        return 3; 
+    }
+
+    // SÉCURITÉ : S'il n'y a aucune voie principale configurée
     if self.next_signals.len() == 0 {
-        if self.mode == ModeCarre::CarreAbsolu { return 2; } 
-        if self.mode == ModeCarre::CarreViolet { return 3; } 
-        return 1;
+        return closed_state;
     }
 
-    let empty_sig = ID<Signal>::empty();
     let n_occ mut= false; 
+    let nn_occ mut= false;
 
+    // 7. CASCADE KVB / AVERTISSEMENT (Voie principale ouverte)
     for sig_id in self.next_signals.iter() {
         if let s1 &= db.view(sig_id) { 
             if let o1 &= db.view<BlockOcc>(s1) { if !o1.train_id.equals(empty_train) { n_occ = true; } }
@@ -732,7 +958,7 @@ pub fn CarreC::event_signal_texture_state(self: &CarreC, db: &DB, signal: &Signa
             if let bc &= db.view<CarreC>(s1) { 
                 for s2_id in bc.next_signals.iter() {
                     if let s2 &= db.view(s2_id) {
-                        if let o2 &= db.view<BlockOcc>(s2) { if !o2.train_id.equals(empty_train) { n_occ = true; } }
+                        if let o2 &= db.view<BlockOcc>(s2) { if !o2.train_id.equals(empty_train) { nn_occ = true; } }
                     }
                 }
             }
@@ -740,23 +966,25 @@ pub fn CarreC::event_signal_texture_state(self: &CarreC, db: &DB, signal: &Signa
                 let sig2 = ba.next_signal;
                 if !sig2.equals(empty_sig) {
                     if let s2 &= db.view(sig2) {
-                        if let o2 &= db.view<BlockOcc>(s2) { if !o2.train_id.equals(empty_train) { n_occ = true; } }
+                        if let o2 &= db.view<BlockOcc>(s2) { if !o2.train_id.equals(empty_train) { nn_occ = true; } }
                     }
                 }
             }
         }
     }
 
-    if n_occ { return 4; } 
+    if n_occ { return 4; } // Jaune
     
-    if self.enable_a_clignotant { 
-        if zmod(zdiv(clock_us, BLINK_US), 2) == 0 { return 5; } 
-        return 6; 
-    }
-    if self.force_vcli { 
-        if zmod(zdiv(clock_us, BLINK_US), 2) == 0 { return 7; } 
-        return 8; 
+    if nn_occ {
+        if self.enable_a_clignotant { 
+            if zmod(zdiv(clock_us, BLINK_US), 2) == 0 { return 6; } 
+            return 5; 
+        }
+        if self.force_vcli { 
+            if zmod(zdiv(clock_us, BLINK_US), 2) == 0 { return 8; } 
+            return 7; 
+        }
     }
 
-    return 0; 
+    return 0; // Vert
 }

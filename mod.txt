@@ -34,6 +34,36 @@ size=2
 textures=bal_textures
 extend=sncf_script BalFRA
 
+
+[SignalTextures]
+id=cc_textures
+name_loc=template_carre_c
+name_en=Carre Type C
+ui_rotate=1
+state=textures/CC/cc_v.svg     
+state=textures/CC/cc_r.svg     
+state=textures/CC/cc_cr.svg    
+state=textures/CC/cc_cv.svg    
+state=textures/CC/cc_a.svg     
+state=textures/CC/cc_ace.svg   
+state=textures/CC/cc_ac.svg    
+state=textures/CC/cc_vce.svg   
+state=textures/CC/cc_vc.svg    
+state=textures/CC/cc_rce.svg   
+state=textures/CC/cc_rc.svg    
+state=textures/CC/cc_b.svg     
+state=textures/CC/cc_bce.svg   
+state=textures/CC/cc_bc.svg    
+
+[SignalTemplate]
+id=sncf_carre_C_template
+name_en=Carre Type C
+name_loc=template_carre_c
+kind=path
+size=2
+textures=cc_textures
+extend=sncf_script CarreC
+
 [Language]
 code_iso_639_2=fra
 name=Français

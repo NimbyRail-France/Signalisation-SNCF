@@ -3,7 +3,7 @@ schema=1
 name=Signalisation SNCF
 desc=Tous les types de signalisation SNCF.
 author=Sami S
-version=0.0.1
+version=0.0.2
 
 [Script]
 id=sncf_script
